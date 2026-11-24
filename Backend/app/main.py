@@ -7,7 +7,7 @@ import sqlite3
 import time
 import ipaddress
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -51,26 +51,11 @@ def init_db():
     with db() as conn:
         conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                metadata TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_messages_session_id_id
-                ON messages(session_id, id);
             CREATE TABLE IF NOT EXISTS response_cache (
                 cache_key TEXT PRIMARY KEY,
                 reply TEXT NOT NULL,
                 metadata TEXT NOT NULL,
                 created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                system_prompt TEXT,
-                updated_at TEXT NOT NULL
             );
             """
         )
@@ -116,12 +101,18 @@ app.add_middleware(
 )
 
 
+class ChatHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=10000)
+
+
 class ChatRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=4000)
     system_prompt: str | None = None
     model: str | None = None
     context_links: list[str] | None = None
+    history: list[ChatHistoryMessage] = Field(default_factory=list, max_length=100)
 
 
 def clean_request(payload: ChatRequest):
@@ -143,26 +134,19 @@ async def health():
     return {"status": "ok", "keys_configured": len(KEYS), "cache_enabled": True}
 
 
-def get_history(session_id: str):
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id ASC",
-            (session_id,),
-        ).fetchall()
-    return [{"role": row["role"], "content": row["content"]} for row in rows]
-
-
-def get_session_system_prompt(session_id: str):
-    with db() as conn:
-        row = conn.execute(
-            "SELECT system_prompt FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
-    return row["system_prompt"] if row else None
-
-
-def cache_key(model: str, messages: list[dict[str, str]], context_links: list[str] | None):
+def cache_key(
+    model: str,
+    messages: list[dict[str, str]],
+    context_links: list[str] | None,
+    session_id: str,
+):
     payload = json.dumps(
-        {"model": model, "messages": messages, "context_links": context_links or []},
+        {
+            "model": model,
+            "messages": messages,
+            "context_links": context_links or [],
+            "session_id": session_id,
+        },
         ensure_ascii=False,
         sort_keys=True,
     )
@@ -184,27 +168,6 @@ def cache_store(key: str, reply: str, metadata: dict[str, Any]):
         conn.execute(
             "INSERT OR REPLACE INTO response_cache(cache_key, reply, metadata, created_at) VALUES (?, ?, ?, ?)",
             (key, reply, json.dumps(metadata), utc_now()),
-        )
-
-
-def store_session_turn(session_id: str, message: str, reply: str, metadata: dict[str, Any], system_prompt: str | None):
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO messages(session_id, role, content, metadata, created_at) VALUES (?, 'user', ?, NULL, ?)",
-            (session_id, message, utc_now()),
-        )
-        conn.execute(
-            "INSERT INTO messages(session_id, role, content, metadata, created_at) VALUES (?, 'assistant', ?, ?, ?)",
-            (session_id, reply, json.dumps(metadata), utc_now()),
-        )
-        conn.execute(
-            """
-            INSERT INTO sessions(session_id, system_prompt, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET system_prompt=excluded.system_prompt,
-                                                   updated_at=excluded.updated_at
-            """,
-            (session_id, system_prompt, utc_now()),
         )
 
 
@@ -343,30 +306,23 @@ async def call_provider(model: str, messages: list[dict[str, str]], simulation: 
 @app.post("/chat")
 async def chat(payload: ChatRequest, x_simulate_failure: str | None = Header(default=None)):
     clean_request(payload)
-    system_prompt = payload.system_prompt
-    if system_prompt is None:
-        system_prompt = get_session_system_prompt(payload.session_id)
-
-    history = get_history(payload.session_id)
-    messages: list[dict[str, str]] = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+    prompt_parts = [payload.system_prompt] if payload.system_prompt else []
     for link in payload.context_links or []:
         text = await fetch_link_context(link)
         if text:
-            system_prompt = f"{system_prompt or ''}\n\nReference {link}:\n{text}".strip()
-    if system_prompt and (not messages or messages[0]["role"] != "system"):
-        messages.insert(0, {"role": "system", "content": system_prompt})
-    elif system_prompt:
-        messages[0]["content"] = system_prompt
-    messages.extend(history)
+            prompt_parts.append(f"Reference {link}:\n{text}")
+    system_prompt = "\n\n".join(prompt_parts)
+    messages: list[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.extend(message.model_dump() for message in payload.history)
     messages.append({"role": "user", "content": payload.message})
 
     requested_model = payload.model or DEFAULT_MODEL
     model = MODEL_ALIASES.get(requested_model)
     if model is None:
         raise HTTPException(status_code=422, detail="unsupported model")
-    key = cache_key(model, messages, payload.context_links)
+    key = cache_key(model, messages, payload.context_links, payload.session_id)
     hit = cache_lookup(key)
     started = time.perf_counter()
     if hit:
@@ -380,7 +336,6 @@ async def chat(payload: ChatRequest, x_simulate_failure: str | None = Header(def
             "key_id": None,
             "fallback_attempts": 0,
         }
-        store_session_turn(payload.session_id, payload.message, reply, metadata, system_prompt)
         return {"session_id": payload.session_id, "reply": reply, "metadata": metadata}
 
     try:
@@ -407,61 +362,4 @@ async def chat(payload: ChatRequest, x_simulate_failure: str | None = Header(def
         "fallback_attempts": fallback_attempts,
     }
     cache_store(key, reply, metadata)
-    store_session_turn(payload.session_id, payload.message, reply, metadata, system_prompt)
     return {"session_id": payload.session_id, "reply": reply, "metadata": metadata}
-
-
-@app.get("/sessions")
-async def list_sessions():
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT grouped.session_id,
-                   (
-                       SELECT content
-                       FROM messages AS first_user
-                       WHERE first_user.session_id = grouped.session_id
-                         AND first_user.role = 'user'
-                       ORDER BY first_user.id ASC
-                       LIMIT 1
-                   ) AS title,
-                   MAX(grouped.created_at) AS updated_at
-            FROM messages AS grouped
-            GROUP BY grouped.session_id
-            ORDER BY MAX(grouped.id) DESC
-            LIMIT 100
-            """
-        ).fetchall()
-    return {"sessions": [dict(row) for row in rows]}
-
-
-@app.get("/sessions/{session_id}/messages")
-async def session_messages(session_id: str):
-    session_id = session_id.strip()
-    if not session_id:
-        raise HTTPException(status_code=422, detail="session_id is required")
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT role, content, metadata FROM messages WHERE session_id = ? ORDER BY id ASC",
-            (session_id,),
-        ).fetchall()
-    if not rows:
-        raise HTTPException(status_code=404, detail="session not found")
-    messages = []
-    for row in rows:
-        item = {"role": row["role"], "content": row["content"]}
-        if row["role"] == "assistant" and row["metadata"]:
-            metadata = json.loads(row["metadata"])
-            item["metadata"] = {
-                "resolution_source": metadata["resolution_source"],
-                "model": metadata["model"],
-                "latency_ms": metadata["latency_ms"],
-                "input_tokens": metadata["input_tokens"],
-                "output_tokens": metadata["output_tokens"],
-            }
-        messages.append(item)
-    return {
-        "session_id": session_id,
-        "messages": messages,
-        "system_prompt": get_session_system_prompt(session_id) or "",
-    }

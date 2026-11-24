@@ -27,16 +27,19 @@ const extractPdfText = async (file) => {
 }
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
-const newSessionId = () => `s-${crypto.randomUUID().slice(0, 8)}`
-const fetchSessions = async () => {
-  const response = await fetch(`${API_URL}/sessions`)
-  if (!response.ok) throw new Error('Could not load your conversations.')
-  return (await response.json()).sessions
-}
-const fetchSessionMessages = async (id) => {
-  const response = await fetch(`${API_URL}/sessions/${encodeURIComponent(id)}/messages`)
-  if (!response.ok) throw new Error('Could not load this conversation.')
-  return response.json()
+const LOCAL_SESSIONS_KEY = 'lyftr.local-sessions.v1'
+const newSessionId = () => `s-${crypto.randomUUID()}`
+const readLocalSessions = () => {
+  const saved = localStorage.getItem(LOCAL_SESSIONS_KEY)
+  if (!saved) return []
+  const sessions = JSON.parse(saved)
+  if (!Array.isArray(sessions) || sessions.some(session =>
+    !session || typeof session.session_id !== 'string' || !Array.isArray(session.messages) ||
+    session.messages.some(message => !message || !['user', 'assistant', 'error'].includes(message.role) || typeof message.content !== 'string')
+  )) {
+    throw new Error('Saved conversations on this device could not be read.')
+  }
+  return sessions
 }
 const formatRelativeTime = (value) => {
   const elapsed = Date.now() - new Date(value).getTime()
@@ -79,25 +82,24 @@ function App() {
       .then(response => response.ok ? response.json() : Promise.reject())
       .then(() => { if (active) setApiState('online') })
       .catch(() => { if (active) setApiState('offline') })
-    const loadRecentSession = async () => {
-      try {
-        const savedSessions = await fetchSessions()
-        if (!active) return
+    try {
+      const savedSessions = readLocalSessions()
+      if (active) {
         setSessions(savedSessions)
         if (savedSessions.length) {
-          const recent = await fetchSessionMessages(savedSessions[0].session_id)
-          if (!active) return
-          setSessionId(savedSessions[0].session_id)
+          const recent = savedSessions[0]
+          setSessionId(recent.session_id)
           setMessages(recent.messages)
           setSystemPrompt(recent.system_prompt || '')
+          const model = MODELS.find(item => item.id === recent.model)
+          if (model) setSelectedModel(model)
         }
-      } catch (error) {
-        if (active) setHistoryError(error.message)
-      } finally {
-        if (active) setHistoryLoading(false)
       }
+    } catch (error) {
+      if (active) setHistoryError(error.message || 'Could not load conversations saved on this device.')
+    } finally {
+      if (active) setHistoryLoading(false)
     }
-    loadRecentSession()
     return () => { active = false }
   }, [])
   useEffect(() => {
@@ -117,34 +119,48 @@ function App() {
     setLinkDraft('')
     setHistoryError('')
   }
-  const refreshSessions = async () => {
+  const saveSession = (session) => {
+    const existing = sessions.find(item => item.session_id === session.session_id)
+    const firstUserMessage = session.messages.find(item => item.role === 'user')
+    const updatedSession = {
+      ...existing,
+      ...session,
+      title: existing?.title || firstUserMessage?.content.slice(0, 100) || 'New chat',
+      updated_at: new Date().toISOString(),
+    }
+    const updatedSessions = [
+      updatedSession,
+      ...sessions.filter(item => item.session_id !== session.session_id),
+    ]
     try {
-      setSessions(await fetchSessions())
+      localStorage.setItem(LOCAL_SESSIONS_KEY, JSON.stringify(updatedSessions))
+      setSessions(updatedSessions)
       setHistoryError('')
     } catch (error) {
-      setHistoryError(error.message)
+      setHistoryError('Could not save this conversation on this device. Check browser storage.')
     }
   }
-  const openSession = async (id) => {
+  const openSession = (id) => {
     if (sending || historyLoading || id === sessionId) return
+    const storedSession = sessions.find(item => item.session_id === id)
+    if (!storedSession) {
+      setHistoryError('This conversation is not saved on this device.')
+      return
+    }
     setHistoryLoading(true)
     setHistoryError('')
-    try {
-      const data = await fetchSessionMessages(id)
-      setSessionId(data.session_id)
-      setMessages(data.messages)
-      setInput('')
-      setSystemPrompt(data.system_prompt || '')
-      setAttachments([])
-      setAttachmentError('')
-      setShowSettings(false)
-      setShowLinkInput(false)
-      setLinkDraft('')
-    } catch (error) {
-      setHistoryError(error.message)
-    } finally {
-      setHistoryLoading(false)
-    }
+    setSessionId(storedSession.session_id)
+    setMessages(storedSession.messages)
+    setInput('')
+    setSystemPrompt(storedSession.system_prompt || '')
+    const model = MODELS.find(item => item.id === storedSession.model)
+    if (model) setSelectedModel(model)
+    setAttachments([])
+    setAttachmentError('')
+    setShowSettings(false)
+    setShowLinkInput(false)
+    setLinkDraft('')
+    setHistoryLoading(false)
   }
   const addPdfFiles = async (event) => {
     const files = Array.from(event.target.files || [])
@@ -191,7 +207,14 @@ function App() {
     const message = input.trim()
     if (!message || sending) return
     setInput('')
-    setMessages(current => [...current, { role: 'user', content: message }])
+    const pendingMessages = [...messages, { role: 'user', content: message }]
+    setMessages(pendingMessages)
+    saveSession({
+      session_id: sessionId,
+      messages: pendingMessages,
+      system_prompt: systemPrompt,
+      model: selectedModel.id,
+    })
     setSending(true)
     try {
       const documentContext = attachments.filter(item => item.type === 'pdf').map(item => `PDF: ${item.name}\n${item.text}`).join('\n\n')
@@ -208,16 +231,33 @@ function App() {
           message,
           model: selectedModel.id,
           system_prompt: promptParts.join('\n\n'),
+          history: messages
+            .filter(item => item.role === 'user' || item.role === 'assistant')
+            .slice(-100)
+            .map(({ role, content }) => ({ role, content })),
           ...(contextLinks.length ? { context_links: contextLinks } : {}),
         }),
       })
       const data = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(data.detail || 'Something went wrong. Please try again.')
-      setMessages(current => [...current, { role: 'assistant', content: data.reply, metadata: data.metadata }])
+      const completedMessages = [...pendingMessages, { role: 'assistant', content: data.reply, metadata: data.metadata }]
+      setMessages(completedMessages)
+      saveSession({
+        session_id: sessionId,
+        messages: completedMessages,
+        system_prompt: systemPrompt,
+        model: selectedModel.id,
+      })
       setApiState('online')
-      refreshSessions()
     } catch (error) {
-      setMessages(current => [...current, { role: 'error', content: error.message || 'Unable to reach the assistant. Check your connection and try again.' }])
+      const failedMessages = [...pendingMessages, { role: 'error', content: error.message || 'Unable to reach the assistant. Check your connection and try again.' }]
+      setMessages(failedMessages)
+      saveSession({
+        session_id: sessionId,
+        messages: failedMessages,
+        system_prompt: systemPrompt,
+        model: selectedModel.id,
+      })
       setApiState('offline')
     } finally { setSending(false) }
   }
@@ -233,7 +273,7 @@ function App() {
       <div className="nav-caption recent-label">RECENT</div>
       <div className="history-list" aria-label="Recent conversations">
         {historyLoading && sessions.length === 0 && <p className="history-message">Loading chats…</p>}
-        {!historyLoading && sessions.length === 0 && <p className="history-message">Your conversations will appear here.</p>}
+        {!historyLoading && sessions.length === 0 && <p className="history-message">Chats are saved only in this browser.</p>}
         {sessions.map(session => <button
           className={`history-item ${session.session_id === sessionId ? 'selected' : ''}`}
           key={session.session_id}

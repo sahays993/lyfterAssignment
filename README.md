@@ -24,9 +24,9 @@ pnpm install
 pnpm dev
 ```
 
-## 3. Design decisions: key fallback, caching, SQLite session storage
+## 3. Design decisions: provider keys, response caching, browser-local history
 
-FastAPI stores all accepted turns and assistant metadata in SQLite. The database path is controlled by `DATABASE_URL`, and Docker mounts `/data` on a named volume. The sidebar lists recent conversations and reloads their messages when selected. LiteLLM performs provider calls and local response caching; an additional SQLite cache guarantees identical first messages are cached across sessions.
+Conversation history is stored in the browser's local storage, so it remains on that browser and does not sync across devices. The backend accepts client-supplied conversation context for inference but does not expose session-list/history endpoints or save new conversation turns. The SQLite response cache is scoped to a random session ID.
 
 Configure Gemini and Groq credentials separately with comma-separated `GEMINI_API_KEYS` and `GROQ_API_KEYS` values. The legacy `LLM_API_KEYS` variable is accepted as Gemini keys only. Each selected model uses only keys for its provider, and retries/failover stay within that provider.
 
