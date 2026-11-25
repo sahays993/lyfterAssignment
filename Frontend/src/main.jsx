@@ -27,6 +27,7 @@ const extractPdfText = async (file) => {
 }
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const HEALTH_CHECK_INTERVAL_MS = 10 * 60 * 1000
 const LOCAL_SESSIONS_KEY = 'lyftr.local-sessions.v1'
 const newSessionId = () => `s-${crypto.randomUUID()}`
 const readLocalSessions = () => {
@@ -78,10 +79,14 @@ function App() {
   }, [theme])
   useEffect(() => {
     let active = true
-    fetch(`${API_URL}/health`)
-      .then(response => response.ok ? response.json() : Promise.reject())
-      .then(() => { if (active) setApiState('online') })
-      .catch(() => { if (active) setApiState('offline') })
+    const checkHealth = () => {
+      fetch(`${API_URL}/health`)
+        .then(response => response.ok ? response.json() : Promise.reject())
+        .then(() => { if (active) setApiState('online') })
+        .catch(() => { if (active) setApiState('offline') })
+    }
+    checkHealth()
+    const healthCheckInterval = window.setInterval(checkHealth, HEALTH_CHECK_INTERVAL_MS)
     try {
       const savedSessions = readLocalSessions()
       if (active) {
@@ -100,7 +105,10 @@ function App() {
     } finally {
       if (active) setHistoryLoading(false)
     }
-    return () => { active = false }
+    return () => {
+      active = false
+      window.clearInterval(healthCheckInterval)
+    }
   }, [])
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
